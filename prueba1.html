@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8"/>
+  <title>Audio reactivo — fondo original + culebritas cambiando de caracteres</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.3/p5.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.3/addons/p5.sound.min.js"></script>
+  <style>
+    html,body { margin: 0; background:#000; }
+    body { display:grid; place-items:center; min-height:100vh; }
+    canvas { image-rendering: pixelated; }
+
+    .overlay {
+      position: fixed; inset: 0; display:grid; place-items:center;
+      background: rgba(0,0,0,.75); color:#fff; font: 600 18px/1.4 system-ui, sans-serif;
+      letter-spacing:.3px; text-align:center;
+    }
+    .btn {
+      display:inline-block; margin-top:12px; padding:10px 16px; border:1px solid #fff6;
+      border-radius:10px; cursor:pointer; user-select:none;
+    }
+    .hint { opacity:.7; font-weight:500; font-size:14px; margin-top:6px }
+
+    .debug {
+      position: fixed; top:10px; left:12px; color:#fff; font: 12px/1.4 ui-monospace, monospace;
+      background: rgba(0,0,0,.35); padding:8px 10px; border-radius:8px;
+      white-space: pre; pointer-events:none; display:none;
+    }
+    .debug.on { display:block; }
+  </style>
+</head>
+<body>
+<div id="overlay" class="overlay">
+  <div>
+    <div>Haz clic para activar el micrófono 🎙️</div>
+    <div class="btn" id="startBtn">Empezar</div>
+    <div class="hint">Culebritas a color que cambian de forma y se mueven con el audio. (tecla <b>d</b>)</div>
+  </div>
+</div>
+<div id="debug" class="debug"></div>
+
+<script>
+/* ---------- grid base ---------- */
+let tileSize = 6;
+let cols, rows;
+let backgroundModules = [];
+let cooldownGrid = [];     // lo reutilizamos para que no “quemen” siempre lo mismo
+let occupiedMask = new Set();
+
+/* ---------- paletas ---------- */
+const BASE_PALETTE  = [0, 32, 64, 128, 192, 255]; // fondo original
+const FLASH_PALETTE = ["#279AF1","#50C5B7","#FB9F89","#FFF07C","#624CAB"];
+
+/* ---------- audio ---------- */
+let mic = null, fft = null;
+let audioReady = false;
+let levelRaw = 0, levelSmoothed = 0, maxLevelSeen = 0.01, prevSmoothed = 0, centroid = 0;
+let debugOn = false;
+
+/* ---------- worms (culebritas) ---------- */
+let worms = []; // cada worm: {segments:[{x,y,age}], color, life, maxLife, stepDelay, stepTimer, maxLen, seed}
+const MAX_WORMS = 400;           // cuántos simultáneos (sube si quieres MAS)
+const BASE_SPAWN_PER_FRAME = 1;  // spawns mínimos
+const EXTRA_SPAWN_PER_FRAME = 6; // spawns extra con audio alto
+const WORM_BASE_LIFE = 260;      // vida base
+const WORM_MIN_LEN = 10;          // largo mínimo (en celdas)
+const WORM_MAX_LEN = 100;         // largo máximo
+const TURN_CHANCE = 0.18;        // probabilidad de girar en cada paso
+const FLOW_SCALE = 0.08;         // escala del campo de ruido para giros
+const SPEED_MIN = 2;             // frames entre pasos (rápidos)
+const SPEED_MAX = 6;             // frames entre pasos (lentos)
+
+/* ---------- clusters (para spawnear varios worms como parche) ---------- */
+const MAX_CLUSTERS_PER_FRAME = 4;
+const MIN_R = 3;
+const MAX_R = 10;
+
+/* ---------- setup ---------- */
+function setup() {
+  createCanvas(1920, 1080);
+  pixelDensity(1);
+  noStroke();
+  cols = floor(width / tileSize);
+  rows = floor(height / tileSize);
+
+  for (let y = 0; y < rows; y++) {
+    backgroundModules[y] = [];
+    cooldownGrid[y] = [];
+    for (let x = 0; x < cols; x++) {
+      backgroundModules[y][x] = {
+        formSeed: random(1000),
+        phase: random(TWO_PI),
+        speedBase: random(0.01, 0.03),
+        gray: random(BASE_PALETTE),
+      };
+      cooldownGrid[y][x] = 0;
+    }
+  }
+
+  document.getElementById('startBtn').addEventListener('click', initAudio);
+}
+
+async function initAudio() {
+  try {
+    userStartAudio();
+    await getAudioContext().resume();
+
+    mic = new p5.AudioIn();
+    await mic.start();
+
+    fft = new p5.FFT(0.8, 1024);
+    fft.setInput(mic);
+
+    audioReady = true;
+    document.getElementById('overlay').style.display = 'none';
+  } catch (e) {
+    console.error(e);
+    alert('No se pudo acceder al micrófono: ' + e.message);
+  }
+}
+
+function draw() {
+  background(0);
+
+  // === AUDIO ===
+  if (audioReady && mic) {
+    levelRaw = mic.getLevel();
+    const FLOOR = 0.001;
+    maxLevelSeen = max(maxLevelSeen * 0.999, levelRaw * 1.1, FLOOR);
+    const levelNorm = constrain(levelRaw / maxLevelSeen, 0, 1);
+    levelSmoothed = lerp(levelSmoothed, levelNorm, 0.15);
+    if (fft) { fft.analyze(); centroid = fft.getCentroid(); }
+  } else {
+    levelRaw = 0;
+    levelSmoothed = lerp(levelSmoothed, 0, 0.1);
+    centroid = 0;
+  }
+
+  // === 1) SPAWN DE WORMS (muchos cuando hay audio) ===
+  const eased = easeOutCubic(levelSmoothed);
+  const spawnCount = BASE_SPAWN_PER_FRAME + floor(eased * EXTRA_SPAWN_PER_FRAME);
+  for (let i = 0; i < spawnCount; i++) {
+    if (worms.length >= MAX_WORMS) break;
+    spawnWormCluster(eased);
+  }
+
+  // === 2) RECONSTRUIR MÁSCARA DE CELDAS OCUPADAS (para no pintar fondo debajo) ===
+  occupiedMask.clear();
+  for (const w of worms) {
+    for (const seg of w.segments) {
+      occupiedMask.add(seg.x + "," + seg.y);
+    }
+  }
+
+  // === 3) FONDO CLÁSICO (omitimos celdas ocupadas) ===
+  const timbreTwist = audioReady ? map(centroid || 0, 800, 6000, -0.6, 0.8) : 0;
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < cols; x++) {
+      if (occupiedMask.has(x + "," + y)) continue;
+
+      const m = backgroundModules[y][x];
+      const alpha = 70 + 40 * sin(frameCount * (m.speedBase) + m.phase);
+      fill(constrain(m.gray, 0, 255), alpha);
+      const f = getDynamicForm(m.formSeed + timbreTwist, frameCount);
+      drawModule(x * tileSize, y * tileSize, tileSize, f);
+
+      if (cooldownGrid[y][x] > 0) cooldownGrid[y][x]--;
+    }
+  }
+
+  // === 4) ACTUALIZAR WORMS (mover), DIBUJARLOS Y ENVEJECER ===
+  for (let wi = worms.length - 1; wi >= 0; wi--) {
+    const w = worms[wi];
+
+    // mover por stepDelay
+    w.stepTimer--;
+    if (w.stepTimer <= 0) {
+      advanceWorm(w);
+      w.stepTimer = w.stepDelay;
+    }
+
+    // dibujar segmentos (color puro, con fade por edad relativa)
+    for (let si = 0; si < w.segments.length; si++) {
+      const seg = w.segments[si];
+      const lifeNorm = 1 - seg.age / w.segmentMaxAge; // 1..0
+      if (lifeNorm <= 0) continue;
+
+      const a = 255 * lifeNorm;
+      const c = color(w.color);
+      c.setAlpha(a);
+      fill(c);
+      noStroke();
+
+      const x = seg.x * tileSize;
+      const y = seg.y * tileSize;
+
+      // Cambiar de "carácter": usa las 4 formas existentes, variando con la edad
+      const type = (floor(seg.age / 8) + w.seedType) % 4;
+      drawModule(x, y, tileSize, type);
+
+      seg.age++;
+    }
+
+    // envejece el worm completo, recorta segmentos vencidos
+    w.life--;
+    while (w.segments.length && w.segments[0].age >= w.segmentMaxAge) {
+      w.segments.shift();
+    }
+
+    if (w.life <= 0 || w.segments.length === 0) {
+      worms.splice(wi, 1);
+    }
+  }
+
+  // === DEBUG ===
+  if (debugOn) {
+    const ctx = getAudioContext?.();
+    const dbg = [
+      `audio: ${audioReady ? 'ON' : 'OFF'}  ctx: ${ctx ? ctx.state : 'n/a'}`,
+      `levelRaw: ${levelRaw.toFixed(5)}`,
+      `maxSeen:  ${maxLevelSeen.toFixed(5)}`,
+      `norm(smooth): ${levelSmoothed.toFixed(3)}`,
+      `worms: ${worms.length}`
+    ].join('\n');
+    const el = document.getElementById('debug');
+    el.textContent = dbg;
+    el.classList.add('on');
+  } else {
+    document.getElementById('debug').classList.remove('on');
+  }
+
+  prevSmoothed = levelSmoothed;
+}
+
+/* ---------- Worm helpers ---------- */
+function spawnWormCluster(eased) {
+  // Decide si spawneamos 1 worm o un pequeño grupo (parche) según audio
+  const clusters = random() < 0.5 + 0.5*eased ? 2 : 1;
+  for (let k = 0; k < clusters; k++) {
+    if (worms.length >= MAX_WORMS) break;
+
+    const cx = floor(random(cols));
+    const cy = floor(random(rows));
+    const r  = floor(lerp(MIN_R, MAX_R, eased)) + floor(random(0, 2));
+
+    // número de worms en el parche: poca carga si audio bajo
+    const wormsInCluster = 1 + floor(random(1 + eased * 3));
+    for (let i = 0; i < wormsInCluster; i++) {
+      const px = constrain(cx + floor(random(-r, r+1)), 0, cols-1);
+      const py = constrain(cy + floor(random(-r, r+1)), 0, rows-1);
+      spawnSingleWorm(px, py, eased);
+      if (worms.length >= MAX_WORMS) break;
+    }
+  }
+}
+
+function spawnSingleWorm(x, y, eased) {
+  const colorStr = random(FLASH_PALETTE);
+  const maxLen = floor(lerp(WORM_MIN_LEN, WORM_MAX_LEN, 0.4 + 0.6*eased));
+  const segmentMaxAge = maxLen + 10; // cuánto “dura” cada segmento (para el fade)
+  const life = floor(WORM_BASE_LIFE * random(0.7, 1.2));
+
+  // velocidad: con más audio, más rápido
+  const stepDelay = floor(lerp(SPEED_MAX, SPEED_MIN, eased));
+  const dir = pickInitialDir();
+
+  const seed = floor(random(10000));
+  const seedType = floor(random(4)); // desfasaje de formas
+
+  const w = {
+    color: colorStr,
+    segments: [{x, y, age: 0}],
+    life,
+    maxLife: life,
+    stepDelay,
+    stepTimer: stepDelay,
+    maxLen,
+    dir,
+    seed,
+    seedType,
+    segmentMaxAge
+  };
+  worms.push(w);
+}
+
+function pickInitialDir() {
+  // 4 direcciones cardinales
+  const dirs = [{x:1,y:0},{x:-1,y:0},{x:0,y:1},{x:0,y:-1}];
+  return random(dirs);
+}
+
+function advanceWorm(w) {
+  const head = w.segments[w.segments.length - 1];
+  let dx = w.dir.x, dy = w.dir.y;
+
+  // girar a veces por campo de flujo con ruido (suaviza cambios)
+  if (random() < TURN_CHANCE) {
+    const ang = noise((head.x)*FLOW_SCALE, (head.y)*FLOW_SCALE, frameCount*0.01 + w.seed*0.001) * TWO_PI;
+    const choice = angleToDir(ang);
+    dx = choice.x; dy = choice.y;
+    w.dir = choice;
+  }
+
+  let nx = head.x + dx;
+  let ny = head.y + dy;
+
+  // envolver bordes (wrap)
+  if (nx < 0) nx = cols - 1;
+  if (nx >= cols) nx = 0;
+  if (ny < 0) ny = rows - 1;
+  if (ny >= rows) ny = 0;
+
+  // si la celda está muy “fresca”, intenta otro giro suave
+  const key = nx + "," + ny;
+  if (cooldownGrid[ny][nx] > 0) {
+    // prueba girar 90° izquierda o derecha
+    const alt1 = {x: -w.dir.y, y: w.dir.x};
+    const alt2 = {x:  w.dir.y, y: -w.dir.x};
+    const cand = random() < 0.5 ? alt1 : alt2;
+    nx = head.x + cand.x;
+    ny = head.y + cand.y;
+    if (nx < 0) nx = cols - 1;
+    if (nx >= cols) nx = 0;
+    if (ny < 0) ny = rows - 1;
+    if (ny >= rows) ny = 0;
+    w.dir = cand;
+  }
+
+  // añade nuevo head
+  w.segments.push({x:nx, y:ny, age:0});
+  cooldownGrid[ny][nx] = 18; // pequeño cooldown para variar el camino
+
+  // limita largo (cola se acorta)
+  while (w.segments.length > w.maxLen) {
+    w.segments.shift();
+  }
+}
+
+/* Convierte ángulo a una de las 4 direcciones principales */
+function angleToDir(a) {
+  const dirs = [
+    {x:1,y:0, ang:0},
+    {x:0,y:1, ang:HALF_PI},
+    {x:-1,y:0, ang:PI},
+    {x:0,y:-1, ang:3*HALF_PI}
+  ];
+  let best = dirs[0], bestd = 999;
+  for (const d of dirs) {
+    const diff = angleDiff(a, d.ang);
+    if (diff < bestd) { bestd = diff; best = d; }
+  }
+  return best;
+}
+function angleDiff(a,b){
+  let d = abs(a-b) % TWO_PI;
+  return d > PI ? TWO_PI - d : d;
+}
+
+/* ---------- helpers de dibujo ---------- */
+function getDynamicForm(seed, frame) {
+  const t = frame * 0.02 + seed;
+  const n = noise(t);
+  return int(n * 4) % 4;
+}
+
+function drawModule(x, y, s, type) {
+  const cx = x + s/2;
+  const cy = y + s/2;
+  if (type === 0) rect(x, y, s, s);
+  else if (type === 1) ellipse(cx, cy, s*0.75);
+  else if (type === 2) {
+    strokeWeight(1);
+    stroke(255, 80); // X blanca del fondo
+    line(x, y, x+s, y+s);
+    line(x+s, y, x, y+s);
+    noStroke();
+  } else if (type === 3) {
+    rect(x + s/4, y + s/4, s/2, s/2);
+  }
+}
+
+function easeOutCubic(t){ return 1 - pow(1 - t, 3); }
+
+/* ---------- teclas ---------- */
+function keyPressed() {
+  if (key === 'd' || key === 'D') debugOn = !debugOn;
+}
+</script>
+</body>
+</html>

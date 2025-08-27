@@ -1,0 +1,677 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8"/>
+  <title>Audio reactivo — MP3 + bandas + tempo + culebritas + grabación HQ</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.3/p5.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.3/addons/p5.sound.min.js"></script>
+  <style>
+    html,body { margin: 0; background:#000; }
+    body { min-height:100vh; display:grid; place-items:center; }
+    /* Canvas 1:1 a 1080p para export nítida */
+    canvas { display:block; width:1920px; height:1080px; }
+
+    /* Controles */
+    .controls {
+      position: fixed; top:12px; left:50%; transform: translateX(-50%);
+      display:flex; gap:8px; align-items:center;
+      background: rgba(0,0,0,.6); color:#fff; padding:8px 10px; border-radius:10px;
+      font: 600 13px system-ui, sans-serif; z-index: 10;
+    }
+    .controls button, .controls label {
+      background: #111; color:#fff; border:1px solid #fff3; border-radius:8px;
+      padding:8px 12px; cursor:pointer;
+    }
+    .controls input[type="file"] { display:none; }
+    .controls .dim { opacity:.65 }
+    .debug {
+      position: fixed; top:58px; left:12px; color:#fff; font: 12px/1.4 ui-monospace, monospace;
+      background: rgba(0,0,0,.35); padding:8px 10px; border-radius:8px; white-space:pre; display:none;
+    }
+    .debug.on { display:block; }
+  </style>
+</head>
+<body>
+
+<div class="controls">
+  <label>
+    <input id="fileInput" type="file" accept="audio/*"/>
+    Cargar MP3
+  </label>
+  <button id="playBtn" class="dim" disabled>Reproducir</button>
+  <button id="recStartBtn" disabled>Grabar</button>
+  <button id="recStopBtn" class="dim" disabled>Detener</button>
+  <a id="downloadLink" class="dim" href="#" download="visual.webm" style="display:none;">Descargar</a>
+  <button id="dbgBtn" title="tecla D">Debug</button>
+</div>
+
+<div id="debug" class="debug"></div>
+
+<script>
+/* ---------- grid base ---------- */
+let tileSize = 6;
+let cols, rows;
+let backgroundModules = [];
+let cooldownGrid = [];     // para variar caminos
+let occupiedMask = new Set();
+
+/* ---------- paletas ---------- */
+const BASE_PALETTE  = [0, 32, 64, 128, 192, 255];
+const FLASH_PALETTE = ["#279AF1","#50C5B7","#FB9F89","#FFF07C","#624CAB"];
+
+/* ---------- audio desde MP3 ---------- */
+let soundFile = null;
+let amp = null;       // p5.Amplitude
+let fft = null;       // p5.FFT
+let peak = null;      // p5.PeakDetect (graves)
+let audioReady = false;
+let levelRaw = 0, levelSmoothed = 0, maxLevelSeen = 0.01, prevSmoothed = 0, centroid = 0;
+
+/* Bandas (0..1 suavizadas) */
+let bassE = 0, midE = 0, trebleE = 0;
+let bassS = 0, midS = 0, trebleS = 0;
+
+/* Tempo simple */
+let lastPeakMs = 0, bpmAvg = 0, beatIntervalMs = 0, nextPredictedBeatMs = 0;
+let beatCount = 0, barCount = 0;
+const BEATS_PER_BAR = 4;
+
+/* ---------- worms (culebritas) ---------- */
+let worms = []; // {segments:[{x,y,age}], color, life, maxLife, stepDelay, stepTimer, maxLen, dir, seed, seedType, segmentMaxAge}
+const MAX_WORMS = 500;
+const EXTRA_SPAWN_PER_FRAME = 7; // base escalada por audio (y boost por graves)
+let   WORM_BASE_LIFE = 280;
+let   WORM_MIN_LEN = 10;
+let   WORM_MAX_LEN = 110;
+let   TURN_CHANCE = 0.16;
+let   FLOW_SCALE = 0.08;
+let   SPEED_MIN = 2;
+let   SPEED_MAX = 6;
+const TYPE_HOLD_FRAMES = 10; // cambia “carácter” cada N frames
+
+/* ---------- clusters ---------- */
+const MAX_CLUSTERS_PER_FRAME = 4;
+const MIN_R = 3;
+const MAX_R = 10;
+
+/* ---------- eventos musicales visuales ---------- */
+let barBurstTimer = 0;     // frames que dura un “modo energía” al inicio del compás
+
+/* ---------- grabación (canvas + audio) ---------- */
+let mediaRecorder = null;
+let recordedChunks = [];
+let combinedStream = null; // canvas video + audio del WebAudio
+
+/* ---------- misc ---------- */
+let debugOn = false;
+
+function setup() {
+  // Canvas EXACTO 1920x1080
+  createCanvas(1920, 1080);
+  pixelDensity(1);
+  noStroke();
+
+  cols = floor(width / tileSize);
+  rows = floor(height / tileSize);
+
+  for (let y = 0; y < rows; y++) {
+    backgroundModules[y] = [];
+    cooldownGrid[y] = [];
+    for (let x = 0; x < cols; x++) {
+      backgroundModules[y][x] = {
+        formSeed: random(1000),
+        phase: random(TWO_PI),
+        speedBase: random(0.01, 0.03),
+        gray: random(BASE_PALETTE),
+      };
+      cooldownGrid[y][x] = 0;
+    }
+  }
+
+  // UI
+  document.getElementById('fileInput').addEventListener('change', handleFile);
+  document.getElementById('playBtn').addEventListener('click', togglePlay);
+  document.getElementById('recStartBtn').addEventListener('click', startRecording);
+  document.getElementById('recStopBtn').addEventListener('click', stopRecording);
+  document.getElementById('dbgBtn').addEventListener('click', ()=>{ debugOn=!debugOn; });
+}
+
+function handleFile(ev) {
+  const f = ev.target.files[0];
+  if (!f) return;
+
+  const url = URL.createObjectURL(f);
+
+  // Detener y liberar anterior (si existía)
+  if (soundFile) {
+    try { soundFile.stop(); soundFile.disconnect(); } catch {}
+    soundFile = null;
+  }
+
+  // Cargar con p5.loadSound usando blob URL
+  loadSound(url, (sf)=>{
+    soundFile = sf;
+
+    // Analizadores
+    amp = new p5.Amplitude();
+    amp.setInput(soundFile);
+    fft = new p5.FFT(0.8, 1024);
+    fft.setInput(soundFile);
+
+    // PeakDetect (graves 20–150 Hz)
+    peak = new p5.PeakDetect(20, 150, 0.14, 24);
+
+    // Al terminar la canción: actualizar botón (los worms se disuelven solos)
+    soundFile.onended(()=>{
+      document.getElementById('playBtn').textContent = 'Reproducir';
+    });
+
+    audioReady = true;
+
+    // Habilitar UI
+    const playBtn = document.getElementById('playBtn');
+    playBtn.disabled = false; playBtn.classList.remove('dim');
+    document.getElementById('recStartBtn').disabled = false;
+
+  }, (err)=>{
+    alert('Error cargando audio: ' + err);
+  });
+}
+
+function togglePlay(){
+  if (!soundFile) return;
+  if (!getAudioContext()) return;
+
+  if (getAudioContext().state !== 'running') {
+    // Requerido por algunos navegadores: reanudar contexto tras interacción
+    getAudioContext().resume();
+  }
+
+  if (soundFile.isPlaying()) {
+    soundFile.pause();
+    document.getElementById('playBtn').textContent = 'Reproducir';
+  } else {
+    soundFile.setVolume(0.95); // evita clipping en la grabación
+    soundFile.play(); // UNA sola vez (sin loop)
+    document.getElementById('playBtn').textContent = 'Pausar';
+  }
+}
+
+function draw() {
+  background(0);
+
+  // === AUDIO (desde MP3) ===
+  if (audioReady && soundFile) {
+    levelRaw = amp ? amp.getLevel() : 0;
+    const FLOOR = 0.001;
+    maxLevelSeen = max(maxLevelSeen * 0.999, levelRaw * 1.1, FLOOR);
+    const levelNorm = constrain(levelRaw / maxLevelSeen, 0, 1);
+    levelSmoothed = lerp(levelSmoothed, levelNorm, 0.15);
+
+    if (fft) {
+      fft.analyze();
+      centroid = fft.getCentroid();
+
+      // Bandas (0..255) -> 0..1 y suaviza
+      const bass = fft.getEnergy(20, 150);
+      const mid  = fft.getEnergy(400, 2000);
+      const treb = fft.getEnergy(4000, 12000);
+      bassE = bass/255; midE = mid/255; trebleE = treb/255;
+      const smooth = (prev, v, a=0.22)=> lerp(prev, v, a);
+      bassS   = smooth(bassS,   bassE);
+      midS    = smooth(midS,    midE);
+      trebleS = smooth(trebleS, trebleE);
+
+      // PeakDetect → beats
+      if (peak) {
+        peak.update(fft);
+        if (peak.isDetected && soundFile.isPlaying()) {
+          onBeat('peak');
+        }
+      }
+
+      // Predicción de beat (si ya estimamos BPM) para mantener compás aunque falte un pico
+      if (soundFile.isPlaying() && bpmAvg > 0 && beatIntervalMs > 0 && levelSmoothed > 0.05) {
+        const now = millis();
+        if (now >= nextPredictedBeatMs && nextPredictedBeatMs > 0) {
+          onBeat('pred');
+          nextPredictedBeatMs += beatIntervalMs;
+        }
+      }
+    }
+  } else {
+    levelRaw = 0;
+    levelSmoothed = lerp(levelSmoothed, 0, 0.1);
+    centroid = 0;
+  }
+
+  // === 1) SPAWN DE WORMS (solo cuando hay audio real y está sonando) ===
+  const eased = easeOutCubic(levelSmoothed);
+  const SILENCE_THRESHOLD = 0.05;
+  let spawnCount = 0;
+  if (soundFile && soundFile.isPlaying() && levelSmoothed > SILENCE_THRESHOLD) {
+    // base por volumen + empuje por graves; pequeño boost si estamos en burst de compás
+    const bassBoost = bassS * 0.9;
+    const barBoost  = barBurstTimer > 0 ? 0.6 : 0.0;
+    spawnCount = floor((eased + bassBoost + barBoost) * EXTRA_SPAWN_PER_FRAME);
+    spawnCount = constrain(spawnCount, 0, EXTRA_SPAWN_PER_FRAME * 3);
+  }
+  for (let i = 0; i < spawnCount; i++) {
+    if (worms.length >= MAX_WORMS) break;
+    spawnWormCluster(eased);
+  }
+
+  // === 2) RECONSTRUIR MÁSCARA (evitar fondo bajo worms) ===
+  occupiedMask.clear();
+  for (const w of worms) {
+    for (const seg of w.segments) {
+      occupiedMask.add(seg.x + "," + seg.y);
+    }
+  }
+
+  // === 3) FONDO ===
+  const timbreTwist = audioReady ? map(centroid || 0, 800, 6000, -0.6, 0.8) : 0;
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < cols; x++) {
+      if (occupiedMask.has(x + "," + y)) continue;
+
+      const m = backgroundModules[y][x];
+      const alpha = 70 + 40 * sin(frameCount * (m.speedBase) + m.phase);
+      fill(constrain(m.gray, 0, 255), alpha);
+      const f = getDynamicForm(m.formSeed + timbreTwist, frameCount);
+      drawModule(x * tileSize, y * tileSize, tileSize, f);
+
+      if (cooldownGrid[y][x] > 0) cooldownGrid[y][x]--;
+    }
+  }
+
+  // === 4) MOVER / DIBUJAR WORMS ===
+  for (let wi = worms.length - 1; wi >= 0; wi--) {
+    const w = worms[wi];
+
+    // mover por stepDelay
+    w.stepTimer--;
+    if (w.stepTimer <= 0) {
+      advanceWorm(w);
+      w.stepTimer = w.stepDelay;
+    }
+
+    // dibujar segmentos (color + fade por edad)
+    for (let si = 0; si < w.segments.length; si++) {
+      const seg = w.segments[si];
+      const lifeNorm = 1 - seg.age / w.segmentMaxAge; // 1..0
+      if (lifeNorm <= 0) continue;
+
+      const a = 255 * lifeNorm;
+      const c = color(w.color);
+      c.setAlpha(a);
+      fill(c);
+      noStroke();
+
+      const x = seg.x * tileSize;
+      const y = seg.y * tileSize;
+
+      // cambio de carácter más lento
+      const type = (floor(seg.age / TYPE_HOLD_FRAMES) + w.seedType) % 4;
+      drawModule(x, y, tileSize, type);
+
+      seg.age++;
+    }
+
+    // recortar y vida del worm
+    w.life--;
+    while (w.segments.length && w.segments[0].age >= w.segmentMaxAge) {
+      w.segments.shift();
+    }
+    if (w.life <= 0 || w.segments.length === 0) {
+      worms.splice(wi, 1);
+    }
+  }
+
+  // Decae el burst de compás
+  if (barBurstTimer > 0) barBurstTimer--;
+
+  // === DEBUG ===
+  if (debugOn) {
+    const dbg = [
+      `audio: ${audioReady ? 'MP3' : 'OFF'}  ctx: ${getAudioContext()?.state || 'n/a'}`,
+      `raw:${levelRaw.toFixed(5)} max:${maxLevelSeen.toFixed(5)} sm:${levelSmoothed.toFixed(3)}`,
+      `bass:${bassS.toFixed(2)} mid:${midS.toFixed(2)} treb:${trebleS.toFixed(2)}`,
+      `BPM~:${bpmAvg ? bpmAvg.toFixed(1) : '-'}`,
+      `beat#:${beatCount}  bar#:${barCount}  barBurst:${barBurstTimer}`,
+      `worms: ${worms.length}`
+    ].join('\n');
+    const el = document.getElementById('debug');
+    el.textContent = dbg;
+    el.classList.add('on');
+  } else {
+    document.getElementById('debug').classList.remove('on');
+  }
+
+  prevSmoothed = levelSmoothed;
+}
+
+/* ---------- manejo de beats ---------- */
+function onBeat(source='peak'){
+  // Burst leve por beat
+  for (let k = 0; k < 2; k++) spawnWormCluster(1.0);
+
+  // Estimar BPM usando deltas de peaks (si el source es peak)
+  const now = millis();
+  if (source === 'peak') {
+    if (lastPeakMs > 0) {
+      const interval = now - lastPeakMs; // ms entre picos
+      const instBpm = constrain(60000 / interval, 50, 200);
+      bpmAvg = bpmAvg ? lerp(bpmAvg, instBpm, 0.18) : instBpm;
+      beatIntervalMs = 60000 / bpmAvg;
+      // si aún no tenemos predicción, arráncala
+      if (!nextPredictedBeatMs) nextPredictedBeatMs = now + beatIntervalMs;
+    }
+    lastPeakMs = now;
+  }
+
+  // Contadores musicales
+  beatCount++;
+  if (beatCount % BEATS_PER_BAR === 0) {
+    barCount++;
+    barBurstTimer = 18; // ~0.3s a 60fps con energía extra
+    // Burst grande al inicio del compás
+    for (let i = 0; i < 8; i++) spawnWormCluster(1.0);
+  }
+}
+
+/* ---------- spawn helpers ---------- */
+function spawnWormCluster(eased) {
+  const clusters = random() < 0.5 + 0.5*eased ? 2 : 1;
+  for (let k = 0; k < clusters; k++) {
+    if (worms.length >= MAX_WORMS) break;
+
+    const cx = floor(random(cols));
+    const cy = floor(random(rows));
+    const r  = floor(lerp(MIN_R, MAX_R, eased)) + floor(random(0, 2));
+
+    const wormsInCluster = 1 + floor(random(1 + eased * 3));
+    for (let i = 0; i < wormsInCluster; i++) {
+      const px = constrain(cx + floor(random(-r, r+1)), 0, cols-1);
+      const py = constrain(cy + floor(random(-r, r+1)), 0, rows-1);
+      spawnSingleWorm(px, py, eased);
+      if (worms.length >= MAX_WORMS) break;
+    }
+  }
+}
+
+function spawnSingleWorm(x, y, eased) {
+  // Color aleatorio de la paleta, ya no depende de bandas
+  const colorStr = random(FLASH_PALETTE);
+
+  // Largo base por nivel global, con boost por beat reciente
+  let maxLen = floor(lerp(WORM_MIN_LEN, WORM_MAX_LEN, 0.4 + 0.6*eased));
+  if (millis() - lastPeakMs < 120) {
+    maxLen = floor(maxLen * 1.2);
+  }
+  maxLen = constrain(maxLen, WORM_MIN_LEN, WORM_MAX_LEN);
+
+  const segmentMaxAge = floor(maxLen * 1.6); // estela más larga
+
+  let life = floor(WORM_BASE_LIFE * random(0.8, 1.25));
+  if (barBurstTimer > 0) life = floor(life * 1.15);
+
+  // Velocidad: depende del nivel general
+  const speedEased = constrain(eased, 0, 1);
+  const stepDelay  = floor(lerp(SPEED_MAX, SPEED_MIN, speedEased));
+
+  const dir = pickInitialDir();
+  const seed = floor(random(10000));
+  const seedType = floor(random(4));
+
+  const w = {
+    color: colorStr,
+    segments: [{x, y, age: 0}],
+    life,
+    maxLife: life,
+    stepDelay,
+    stepTimer: stepDelay,
+    maxLen,
+    dir,
+    seed,
+    seedType,
+    segmentMaxAge
+  };
+  worms.push(w);
+}
+
+  // Largo base por nivel global, con boost por beat reciente
+  let maxLen = floor(lerp(WORM_MIN_LEN, WORM_MAX_LEN, 0.4 + 0.6*eased));
+  if (millis() - lastPeakMs < 120) {
+    maxLen = floor(maxLen * 1.2);
+  }
+  maxLen = constrain(maxLen, WORM_MIN_LEN, WORM_MAX_LEN);
+
+  // Estela
+  const segmentMaxAge = floor(maxLen * 1.6);
+
+  // Vida del worm
+  let life = floor(WORM_BASE_LIFE * random(0.8, 1.25));
+  if (barBurstTimer > 0) life = floor(life * 1.15);
+
+  // Velocidad por agudos (más agudos => más rápido)
+  const speedEased = constrain(eased*0.6 + trebleS*0.4, 0, 1);
+  const stepDelay  = floor(lerp(SPEED_MAX, SPEED_MIN, speedEased));
+
+  const dir = pickInitialDir();
+  const seed = floor(random(10000));
+  const seedType = floor(random(4));
+
+  const w = {
+    color: colorStr,
+    segments: [{x, y, age: 0}],
+    life,
+    maxLife: life,
+    stepDelay,
+    stepTimer: stepDelay,
+    maxLen,
+    dir,
+    seed,
+    seedType,
+    segmentMaxAge
+  };
+  worms.push(w);
+}
+
+function pickInitialDir() {
+  const dirs = [{x:1,y:0},{x:-1,y:0},{x:0,y:1},{x:0,y:-1}];
+  return random(dirs);
+}
+
+function advanceWorm(w) {
+  const head = w.segments[w.segments.length - 1];
+  let dx = w.dir.x, dy = w.dir.y;
+
+  // TURN_CHANCE dinámico: medios/agudos aportan “nerviosismo”
+  const turnNow = TURN_CHANCE + midS*0.12 + trebleS*0.08;
+  if (random() < turnNow) {
+    const ang = noise(head.x*FLOW_SCALE, head.y*FLOW_SCALE, frameCount*0.01 + w.seed*0.001) * TWO_PI;
+    const choice = angleToDir(ang);
+    dx = choice.x; dy = choice.y;
+    w.dir = choice;
+  }
+
+  let nx = head.x + dx;
+  let ny = head.y + dy;
+
+  // wrap
+  if (nx < 0) nx = cols - 1;
+  if (nx >= cols) nx = 0;
+  if (ny < 0) ny = rows - 1;
+  if (ny >= rows) ny = 0;
+
+  if (cooldownGrid[ny][nx] > 0) {
+    const alt1 = {x: -w.dir.y, y: w.dir.x};
+    const alt2 = {x:  w.dir.y, y: -w.dir.x};
+    const cand = random() < 0.5 ? alt1 : alt2;
+    nx = head.x + cand.x;
+    ny = head.y + cand.y;
+    if (nx < 0) nx = cols - 1;
+    if (nx >= cols) nx = 0;
+    if (ny < 0) ny = rows - 1;
+    if (ny >= rows) ny = 0;
+    w.dir = cand;
+  }
+
+  w.segments.push({x:nx, y:ny, age:0});
+  cooldownGrid[ny][nx] = 18;
+
+  while (w.segments.length > w.maxLen) {
+    w.segments.shift();
+  }
+}
+
+/* dir helpers */
+function angleToDir(a) {
+  const dirs = [
+    {x:1,y:0, ang:0},
+    {x:0,y:1, ang:HALF_PI},
+    {x:-1,y:0, ang:PI},
+    {x:0,y:-1, ang:3*HALF_PI}
+  ];
+  let best = dirs[0], bestd = 999;
+  for (const d of dirs) {
+    const diff = angleDiff(a, d.ang);
+    if (diff < bestd) { bestd = diff; best = d; }
+  }
+  return best;
+}
+function angleDiff(a,b){
+  let d = abs(a-b) % TWO_PI;
+  return d > PI ? TWO_PI - d : d;
+}
+
+/* ---------- helpers de dibujo ---------- */
+function getDynamicForm(seed, frame) {
+  const t = frame * 0.02 + seed;
+  const n = noise(t);
+  return int(n * 4) % 4;
+}
+function drawModule(x, y, s, type) {
+  const cx = x + s/2;
+  const cy = y + s/2;
+  if (type === 0) rect(x, y, s, s);
+  else if (type === 1) ellipse(cx, cy, s*0.75);
+  else if (type === 2) {
+    strokeWeight(1);
+    stroke(255, 80);
+    line(x, y, x+s, y+s);
+    line(x+s, y, x, y+s);
+    noStroke();
+  } else if (type === 3) {
+    rect(x + s/4, y + s/4, s/2, s/2);
+  }
+}
+function easeOutCubic(t){ return 1 - pow(1 - t, 3); }
+
+/* ---------- grabación (canvas + audio del MP3) ---------- */
+function startRecording() {
+  if (mediaRecorder) return; // ya grabando
+  if (!soundFile) { alert("Carga y reproduce un MP3 antes de grabar."); return; }
+
+  // stream de video desde el canvas
+  const canvas = document.querySelector('canvas');
+  const fps = 60;
+  const videoStream = canvas.captureStream(fps);
+
+  // Intento forzar 60 fps y 1080p exactos
+  const vt = videoStream.getVideoTracks()[0];
+  if (vt && vt.applyConstraints) {
+    vt.applyConstraints({ frameRate: 60, width: 1920, height: 1080 }).catch(()=>{});
+  }
+
+  // tomar audio del WebAudio (p5) y mezclarlo
+  const ac = getAudioContext();
+  const dest = ac.createMediaStreamDestination();
+
+  try {
+    // routear: altavoces + destino de grabación
+    soundFile.disconnect();
+    soundFile.connect(ac.destination);
+    soundFile.connect(dest);
+    if (amp) amp.setInput(soundFile);
+    if (fft) fft.setInput(soundFile);
+  } catch (e) {
+    console.warn('Routing error:', e);
+  }
+
+  // combinar pistas
+  combinedStream = new MediaStream();
+  videoStream.getVideoTracks().forEach(t => combinedStream.addTrack(t));
+  dest.stream.getAudioTracks().forEach(t => combinedStream.addTrack(t));
+
+  // MIME + bitrates altos
+  const mimeTypeChoices = [
+    'video/webm;codecs=vp9,opus',
+    'video/webm;codecs=vp8,opus',
+    'video/webm'
+  ];
+  let mimeType = '';
+  for (const m of mimeTypeChoices) {
+    if (MediaRecorder.isTypeSupported(m)) { mimeType = m; break; }
+  }
+  if (!mimeType) {
+    alert('Tu navegador no soporta MediaRecorder con los códecs probados.');
+    return;
+  }
+
+  const REC_VIDEO_BPS = 28_000_000; // 28 Mbps (sube si tu PC lo aguanta)
+  const REC_AUDIO_BPS = 256_000;    // 256 kbps
+
+  recordedChunks = [];
+  mediaRecorder = new MediaRecorder(combinedStream, {
+    mimeType,
+    videoBitsPerSecond: REC_VIDEO_BPS,
+    audioBitsPerSecond: REC_AUDIO_BPS
+  });
+
+  mediaRecorder.ondataavailable = (e)=>{
+    if (e.data && e.data.size > 0) recordedChunks.push(e.data);
+  };
+  mediaRecorder.onstop = ()=>{
+    const blob = new Blob(recordedChunks, { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const a = document.getElementById('downloadLink');
+    a.href = url;
+    a.style.display = 'inline-block';
+    a.classList.remove('dim');
+    // reset state
+    mediaRecorder = null;
+    combinedStream = null;
+    try {
+      soundFile.disconnect();
+      soundFile.connect(getAudioContext().destination);
+    } catch {}
+    // botones
+    document.getElementById('recStartBtn').disabled = false;
+    document.getElementById('recStopBtn').disabled = true;
+  };
+
+  // timeslice más largo = menos fragmentación y mejor tasa de bits efectiva
+  mediaRecorder.start(500); // recolecta data cada 500ms
+
+  // botones UI
+  document.getElementById('recStartBtn').disabled = true;
+  document.getElementById('recStopBtn').disabled = false;
+  document.getElementById('recStopBtn').classList.remove('dim');
+  document.getElementById('downloadLink').style.display = 'none';
+  document.getElementById('downloadLink').classList.add('dim');
+}
+
+function stopRecording() {
+  if (!mediaRecorder) return;
+  mediaRecorder.stop();
+}
+
+/* ---------- teclas ---------- */
+function keyPressed() {
+  if (key === 'd' || key === 'D') debugOn = !debugOn;
+}
+</script>
+</body>
+</html>
